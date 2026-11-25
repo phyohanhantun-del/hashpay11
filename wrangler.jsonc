@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hashpay11",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/*", "!/assets/*"]
+  },
+  "observability": {
+    "enabled": true
+  },
+  "dev": {
+    "port": 8787
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hashpay",
+      "migrations_dir": "src/server/db/d1/migrations","database_id": "82b02abc-4f58-4c99-a2e5-6bf31b6b7f84"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "QUEUE_NOTIFY",
+        "queue": "hashpay-notify"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "hashpay-notify",
+        "max_batch_size": 10
+      }
+    ]
+  },
+  "ratelimits": [
+    {
+      "name": "RATE_LIMIT",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 8,
+        "period": 10
+      }
+    }
+  ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
+}

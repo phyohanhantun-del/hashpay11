@@ -1,0 +1,148 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { checkoutOptions, choices, networkIcon, networkName, paymentInstruction, txUrl } from "@/app/payments";
+import { browserMatches, canProbeInBrowser } from "@/app/payments/browser";
+import { setLocale } from "@/app/i18n";
+import { assetName, paymentAssetIcon, paymentById, trc20Assets } from "@/shared/payments";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("frontend payment module", () => {
+  it("keeps asset display helpers frontend-only", () => {
+    expect(assetName("gram")).toBe("GRAM (ex TON)");
+    expect(paymentAssetIcon("gram")).toBe("icon-ton");
+  });
+
+  it("normalizes checkout options and removes duplicate asset-network pairs", () => {
+    expect(checkoutOptions([
+      { amount: 10, asset: "USDT", network: "TRC20" },
+      { amount: 11, asset: "usdt", network: "trc20" },
+      { amount: 12, asset: "GRAM", network: "TON" },
+    ])).toEqual([
+      {
+        amount: 10,
+        asset: "usdt",
+        label: "TRC20 (TRON) / USDT",
+        network: "trc20",
+        value: "usdt:trc20",
+      },
+      {
+        amount: 12,
+        asset: "gram",
+        label: "TON / GRAM (ex TON)",
+        network: "ton",
+        value: "gram:ton",
+      },
+    ]);
+  });
+
+  it("exposes per-network frontend abilities", () => {
+    expect(txUrl({ driver: "trc20", tx: { txid: "abc" } })).toBe("https://tronscan.org/#/transaction/abc");
+    expect(txUrl({ driver: "ton", tx: { txid: "abc" } })).toBe("https://tonviewer.com/transaction/abc");
+    expect(txUrl({ driver: "aptos", tx: { txid: "123" } })).toBe("https://explorer.aptoslabs.com/txn/123?network=mainnet");
+    expect(txUrl({ driver: "solana", tx: { txid: "sig" } })).toBe("https://solscan.io/tx/sig");
+    expect(txUrl({ driver: "base", tx: { txid: "0xabc" } })).toBe("https://basescan.org/tx/0xabc");
+    expect(txUrl({ driver: "xlayer", tx: { txid: "0xabc" } })).toBe("https://web3.okx.com/explorer/x-layer/evm/tx/0xabc");
+    expect(canProbeInBrowser({ address: "0x0000000000000000000000000000000000000001", driver: "xlayer" })).toBe(true);
+    const evm = choices("chain").find((item) => item.id === "evm");
+    expect(evm?.networks).toContain("xlayer");
+    expect(evm?.network).toBe("erc20");
+    expect(choices("chain").filter((item) => item.evm)).toHaveLength(1);
+    expect(choices("chain", "xlayer").map((item) => item.id)).toEqual(["xlayer"]);
+    expect(paymentById("xlayer")?.assets).toEqual(["usdt", "usdc"]);
+    expect(networkIcon("xlayer")).toBe("icon-xlayer");
+  });
+
+  it("uses exchange transfer wording for exchange drivers", () => {
+    setLocale("zh-CN");
+    expect(networkName("binance")).toBe("Binance 币安 内部");
+    expect(networkName("okx")).toBe("OKX 欧易 内部");
+    expect(networkName("trc20")).toBe("TRC20 (TRON)");
+    expect(networkName("xlayer")).toBe("X Layer");
+    expect(paymentInstruction({ currency: "usdt", driver: "binance" })).toBe("请通过 Binance 币安 内部转账 USDT");
+  });
+
+  it("probes browser-supported TRC20 payments before server checks", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      data: [
+        trc20Tx({ hash: "too-small", value: "9900000" }),
+        trc20Tx({ hash: "paid", value: "10000000" }),
+      ],
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const matches = await browserMatches(
+      { address: tronAddress, amount: 10, currency: "usdt", driver: "trc20" },
+      { createdAt: 100, expireAt: 200 },
+      false,
+    );
+
+    expect(canProbeInBrowser({ address: tronAddress, driver: "trc20" })).toBe(true);
+    expect(matches.map((item) => item.hash)).toEqual(["paid"]);
+    expect(String((fetchMock.mock.calls[0] as unknown[] | undefined)?.[0])).toContain("https://api.trongrid.io/v1/accounts/");
+  });
+
+  it("probes BSC payments when the RPC rejects the latest log range tag", async () => {
+    const now = 1_800_000_120;
+    vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+    const address = "0x0000000000000000000000000000000000000001";
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        method?: string;
+        params?: Array<{ toBlock?: string }>;
+      };
+      if (body.method === "eth_blockNumber") return new Response(JSON.stringify({ result: "0x7a01000" }));
+      if (body.params?.[0]?.toBlock === "latest") {
+        return new Response(JSON.stringify({ error: { code: -32000, message: "exceed maximum block range: 5000" } }));
+      }
+      return new Response(JSON.stringify({ result: [{ data: "0x8ac7230489e80000", transactionHash: "0xbrowser-paid" }] }));
+    }));
+
+    const matches = await browserMatches(
+      { address, amount: 10, currency: "usdt", driver: "bep20" },
+      { createdAt: now - 10, expireAt: now + 100 },
+      true,
+    );
+
+    expect(matches.map((item) => item.hash)).toEqual(["0xbrowser-paid"]);
+  });
+
+  it("does not probe unsupported browser payment drivers", async () => {
+    expect(canProbeInBrowser({ address: "2itEPQiRbuLQZzdubQFgx2P9M9mpREoNdPKng3M7sf5o", driver: "solana" })).toBe(false);
+    await expect(browserMatches(
+      { address: "2itEPQiRbuLQZzdubQFgx2P9M9mpREoNdPKng3M7sf5o", amount: 1, currency: "usdt", driver: "solana" },
+      { createdAt: 100, expireAt: 200 },
+      false,
+    )).resolves.toEqual([]);
+  });
+
+  it("ignores approvals when probing TRC20 payments in the browser", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: [
+      { ...trc20Tx({ hash: "approval", value: "10000000" }), type: "Approval" },
+      trc20Tx({ hash: "transfer", value: "10000000" }),
+    ] }))));
+
+    const matches = await browserMatches(
+      { address: tronAddress, amount: 10, currency: "usdt", driver: "trc20" },
+      { createdAt: 100, expireAt: 200 },
+      false,
+    );
+
+    expect(matches.map((item) => item.hash)).toEqual(["transfer"]);
+  });
+});
+
+const tronAddress = "TY1ykSFu8N4mZgxsJABLGdhcs91h1N2qR2";
+
+function trc20Tx(input: { hash: string; value: string }) {
+  return {
+    type: "Transfer",
+    block_timestamp: 120_000,
+    to: tronAddress,
+    token_info: { address: trc20Assets.usdt.contract, decimals: 6, symbol: "USDT" },
+    transaction_id: input.hash,
+    value: input.value,
+  };
+}

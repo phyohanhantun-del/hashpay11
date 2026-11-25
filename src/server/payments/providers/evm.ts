@@ -1,0 +1,187 @@
+import type { PaymentChannel } from "@/server/payments/channels";
+import type { PaymentCheckInput } from "@/server/payments/driver";
+import { paymentMatches } from "@/server/payments/match";
+import { fetchJson, fetchText, host, reason } from "@/server/utils/http";
+import { unitAmount } from "@/shared/amount";
+import { evmAssets, key } from "@/shared/payments";
+import type { TxCandidate } from "@/shared/types/domain";
+import type { PaymentSnapshot } from "@/shared/types/domain";
+
+export const evm = { check, scan };
+
+const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const logSpan = 100;
+
+type Chain = {
+  blockSeconds: number;
+  explorer?: string;
+  rpc?: string;
+};
+
+const chains: Record<string, Chain> = {
+  base: { blockSeconds: 2, explorer: "https://base.blockscout.com" },
+  bep20: { blockSeconds: 0.4, rpc: "https://bsc-rpc.publicnode.com" },
+  erc20: { blockSeconds: 12, explorer: "https://eth.blockscout.com" },
+  polygon: { blockSeconds: 2, rpc: "https://gateway.tenderly.co/public/polygon" },
+  xlayer: { blockSeconds: 1, rpc: "https://xlayer-mainnet.rpc.sentio.xyz" },
+};
+
+async function check(channel: PaymentChannel) {
+  const chain = chains[key(channel.driver)];
+  if (!chain) throw new Error("EVM network is not configured");
+  if (!chain.explorer) {
+    await rpc(chain, "eth_blockNumber", []);
+    return;
+  }
+  await fetchJson<Record<string, unknown>>(`${chain.explorer}/api/v2/addresses/${channel.address}`);
+}
+
+async function scan(input: PaymentCheckInput) {
+  const txs = await transactions(input);
+  return paymentMatches(input.orders, txs, match, (tx) => ({ time: tx.timestamp, txid: tx.hash }), input.tolerance);
+}
+
+async function transactions(input: PaymentCheckInput) {
+  const first = input.orders[0]?.snapshot;
+  const network = key(first?.driver);
+  const chain = chains[network];
+  const address = String(input.channel?.address ?? first?.address ?? "");
+  if (!chain || !address) return [];
+  const from = Math.min(...input.orders.map((order) => order.createdAt));
+  const assets = Array.from(new Set(input.orders.map((order) => key(order.snapshot.currency)).filter(Boolean)));
+  const txs = [];
+  for (const asset of assets) {
+    if (chain.explorer) txs.push(...await blockscout(chain.explorer, address, asset, network));
+    else txs.push(...await rpcScan(chain, address, asset, network, from));
+  }
+  return txs;
+}
+
+async function blockscout(baseUrl: string, address: string, asset: string, network: string) {
+  const token = evmAssets[network]?.[asset];
+  if (token) {
+    const params = new URLSearchParams({ token: token.contract, type: "ERC-20" });
+    const payload = await fetchJson<{ items?: unknown[] }>(`${baseUrl}/api/v2/addresses/${address}/token-transfers?${params}`);
+    return (payload.items ?? []).map((item) => {
+      const row = item as Record<string, unknown>;
+      const total = row.total as { value?: unknown } | undefined;
+      return {
+        amount: unitAmount(total?.value, token.decimals),
+        currency: asset,
+        hash: String(row.transaction_hash ?? ""),
+        raw: row,
+        timestamp: time(row.timestamp),
+        to: addressOf(row.to),
+      };
+    });
+  }
+
+  const payload = await fetchJson<{ items?: unknown[] }>(`${baseUrl}/api/v2/addresses/${address}/transactions`);
+  return (payload.items ?? []).flatMap((item) => {
+    const row = item as Record<string, unknown>;
+    if (row.status !== "ok") return [];
+    return [{
+      amount: unitAmount(row.value, 18),
+      currency: asset,
+      hash: String(row.hash ?? ""),
+      raw: row,
+      timestamp: time(row.timestamp),
+      to: addressOf(row.to),
+    }];
+  });
+}
+
+async function rpcScan(chain: Chain, address: string, asset: string, network: string, createdAt: number) {
+  const token = evmAssets[network]?.[asset];
+  return token ? tokenLogs(chain, address, asset, token.contract, token.decimals, createdAt) : [];
+}
+
+async function tokenLogs(chain: Chain, address: string, asset: string, contract: string, decimals: number, createdAt: number) {
+  const latest = Number.parseInt(await rpc<string>(chain, "eth_blockNumber", []), 16);
+  const from = latest - Math.ceil((Date.now() / 1000 - createdAt) / chain.blockSeconds);
+  const spans = Array.from({ length: Math.ceil((latest - from + 1) / logSpan) }, (_, index) => from + index * logSpan);
+  const chunks = await Promise.all(spans.map((start) => rpc<Array<Record<string, unknown>>>(chain, "eth_getLogs", [{
+    address: contract,
+    fromBlock: hex(start),
+    toBlock: hex(Math.min(latest, start + logSpan - 1)),
+    topics: [transferTopic, null, topicAddress(address)],
+  }])));
+  return chunks.flat().map((log) => ({
+    amount: unitAmount(log.data, decimals),
+    currency: asset,
+    hash: String(log.transactionHash ?? ""),
+    raw: { ...log, contract },
+    timestamp: rpcTimestamp(log.blockTimestamp),
+    to: address,
+  }));
+}
+
+function match(snapshot: PaymentSnapshot, tx: TxCandidate, created: number, expire: number) {
+  const network = key(snapshot.driver);
+  const asset = key(snapshot.currency);
+  const token = evmAssets[network]?.[asset];
+  const valid = Boolean(tx.hash)
+    && tx.timestamp >= created
+    && tx.timestamp <= expire
+    && key(tx.currency) === asset
+    && (!token || lower(contract(tx.raw)) === lower(token.contract))
+    && lower(snapshot.address) === lower(tx.to);
+  return valid ? tx.amount : null;
+}
+
+async function rpc<T>(chain: Chain, method: string, params: unknown[]) {
+  if (!chain.rpc) throw new Error("RPC is not configured");
+  const { res, text } = await fetchText(chain.rpc, {
+    body: JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`${host(chain.rpc)} ${method}: HTTP ${res.status} ${reason(text || res.statusText)}`.trim());
+  const payload = parseRpc<T>(text, chain.rpc, method);
+  if (payload.error || payload.result === undefined) {
+    throw new Error(`${host(chain.rpc)} ${method}: ${reason(payload.error?.message ?? "RPC response is invalid")}`);
+  }
+  return payload.result;
+}
+
+function addressOf(value: unknown) {
+  return typeof value === "string" ? value : String((value as { hash?: unknown } | null)?.hash ?? "");
+}
+
+function contract(raw: unknown) {
+  const row = raw as Record<string, unknown>;
+  const token = row.token as { address_hash?: unknown } | undefined;
+  return row.contract ?? row.address ?? row.contractAddress ?? token?.address_hash ?? "";
+}
+
+function lower(value: unknown) {
+  return String(value ?? "").toLowerCase();
+}
+
+function parseRpc<T>(text: string, url: string, method: string) {
+  try {
+    return JSON.parse(text || "{}") as { error?: { message?: string }; result?: T };
+  } catch {
+    throw new Error(`${host(url)} ${method}: invalid JSON ${reason(text)}`);
+  }
+}
+
+function time(value: unknown) {
+  return Math.floor(Date.parse(String(value)) / 1000);
+}
+
+function rpcTimestamp(value: unknown) {
+  const raw = String(value ?? "").trim();
+  if (!/^0x[\da-f]+$/i.test(raw)) throw new Error("EVM RPC log blockTimestamp is invalid");
+  const timestamp = Number.parseInt(raw, 16);
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) throw new Error("EVM RPC log blockTimestamp is invalid");
+  return timestamp;
+}
+
+function hex(value: number) {
+  return `0x${value.toString(16)}`;
+}
+
+function topicAddress(address: string) {
+  return `0x${address.slice(2).toLowerCase().padStart(64, "0")}`;
+}

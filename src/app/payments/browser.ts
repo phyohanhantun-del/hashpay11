@@ -1,0 +1,294 @@
+import { sameAmount, unitAmount } from "@/shared/amount";
+import { aptosAssets, evmAssets, key, tonAssets, trc20Assets } from "@/shared/payments";
+import { trc20Candidate, trxCandidate, type TronGridNativeTx, type TronGridTokenTx } from "@/shared/trongrid";
+import type { TxCandidate } from "@/shared/types/domain";
+
+type ProbePayment = {
+  address?: string;
+  amount?: number;
+  currency?: string;
+  driver?: string;
+};
+type ProbeOrder = {
+  createdAt?: number;
+  expireAt?: number;
+};
+type Probe = (payment: ProbePayment, order: ProbeOrder, fastConfirm: boolean) => Promise<TxCandidate[]>;
+
+const checks: Record<string, Probe> = {
+  aptos,
+  base,
+  bep20,
+  erc20,
+  polygon,
+  ton,
+  trc20,
+  xlayer,
+};
+const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const logSpan = 100;
+
+export function canProbeInBrowser(payment: ProbePayment) {
+  return Boolean(payment.address && checks[key(payment.driver)]);
+}
+
+export async function browserMatches(payment: ProbePayment, order: ProbeOrder, fastConfirm: boolean) {
+  const check = checks[key(payment.driver)];
+  if (!payment.address || !check) return [];
+  return (await check(payment, order, fastConfirm)).filter((tx) => matches(payment, order, tx));
+}
+
+async function trc20(payment: ProbePayment, order: ProbeOrder, fastConfirm: boolean) {
+  const address = String(payment.address || "");
+  const asset = key(payment.currency);
+  const params = new URLSearchParams({
+    limit: "50",
+    min_timestamp: String(Math.max(0, Number(order.createdAt ?? 0)) * 1000),
+    only_confirmed: fastConfirm ? "false" : "true",
+  });
+
+  if (asset === "trx") {
+    params.set("only_to", "true");
+    return valid((await tronGrid<TronGridNativeTx>(address, "transactions", params)).map((item) => trxCandidate(item, address)));
+  }
+
+  const token = trc20Assets[asset];
+  if (!token) return [];
+  params.set("contract_address", token.contract);
+  return valid((await tronGrid<TronGridTokenTx>(address, "transactions/trc20", params)).map((item) => trc20Candidate(item, asset)));
+}
+
+function erc20(payment: ProbePayment) {
+  return blockscout("https://eth.blockscout.com", payment);
+}
+
+function base(payment: ProbePayment) {
+  return blockscout("https://base.blockscout.com", payment);
+}
+
+function polygon(payment: ProbePayment, order: ProbeOrder) {
+  return tokenLogs("https://gateway.tenderly.co/public/polygon", 2, payment, order);
+}
+
+async function bep20(payment: ProbePayment, order: ProbeOrder) {
+  return tokenLogs("https://bsc-rpc.publicnode.com", 0.4, payment, order);
+}
+
+function xlayer(payment: ProbePayment, order: ProbeOrder) {
+  return tokenLogs("https://xlayer-mainnet.rpc.sentio.xyz", 1, payment, order);
+}
+
+async function tokenLogs(endpoint: string, blockSeconds: number, payment: ProbePayment, order: ProbeOrder) {
+  const asset = key(payment.currency);
+  const token = evmAssets[key(payment.driver)]?.[asset];
+  const address = payment.address;
+  if (!token || !address) return [];
+  const latest = Number.parseInt(await rpc<string>(endpoint, "eth_blockNumber", []), 16);
+  const from = latest - Math.ceil((Date.now() / 1000 - Number(order.createdAt ?? 0)) / blockSeconds);
+  const spans = Array.from({ length: Math.ceil((latest - from + 1) / logSpan) }, (_, index) => from + index * logSpan);
+  const chunks = await Promise.all(spans.map((start) => rpc<Array<Record<string, unknown>>>(endpoint, "eth_getLogs", [{
+    address: token.contract,
+    fromBlock: hex(start),
+    toBlock: hex(Math.min(latest, start + logSpan - 1)),
+    topics: [transferTopic, null, topicAddress(address)],
+  }])));
+  return valid(chunks.flat().map((log) => ({
+    amount: unitAmount(log.data, token.decimals),
+    currency: asset,
+    hash: String(log.transactionHash ?? ""),
+    raw: { ...log, contract: token.contract },
+    timestamp: Math.floor(Date.now() / 1000),
+    to: address,
+  })));
+}
+
+async function blockscout(baseUrl: string, payment: ProbePayment) {
+  const network = key(payment.driver);
+  const asset = key(payment.currency);
+  const token = evmAssets[network]?.[asset];
+  const address = String(payment.address || "");
+  if (!address) return [];
+
+  if (token) {
+    const params = new URLSearchParams({ token: token.contract, type: "ERC-20" });
+    const payload = await json<{ items?: unknown[] }>(`${baseUrl}/api/v2/addresses/${address}/token-transfers?${params}`);
+    return valid((payload.items ?? []).map((item) => {
+      const row = item as Record<string, unknown>;
+      const total = row.total as { value?: unknown } | undefined;
+      return {
+        amount: unitAmount(total?.value, token.decimals),
+        currency: asset,
+        hash: String(row.transaction_hash ?? ""),
+        raw: row,
+        timestamp: time(row.timestamp),
+        to: addressOf(row.to),
+      };
+    }));
+  }
+
+  const payload = await json<{ items?: unknown[] }>(`${baseUrl}/api/v2/addresses/${address}/transactions`);
+  return valid((payload.items ?? []).map((item) => {
+    const row = item as Record<string, unknown>;
+    return {
+      amount: unitAmount(row.value, 18),
+      currency: asset,
+      hash: String(row.hash ?? ""),
+      raw: row,
+      timestamp: time(row.timestamp),
+      to: addressOf(row.to),
+    };
+  }));
+}
+
+async function ton(payment: ProbePayment, order: ProbeOrder) {
+  const address = String(payment.address || "");
+  const asset = key(payment.currency);
+  const start = Math.max(0, Number(order.createdAt ?? 0));
+  const end = Math.max(start, Number(order.expireAt ?? 0));
+  if (!address || !end) return [];
+
+  if (asset === "gram") {
+    const payload = await json<{ transactions?: unknown[] }>(`https://toncenter.com/api/v3/transactions?account=${encodeURIComponent(address)}&limit=50&sort=desc&start_utime=${start}&end_utime=${end}`);
+    return valid((payload.transactions ?? []).map((item) => {
+      const row = item as Record<string, unknown>;
+      const inMsg = row.in_msg as { value?: unknown } | undefined;
+      return {
+        amount: unitAmount(inMsg?.value, 9),
+        currency: asset,
+        hash: String(row.hash ?? ""),
+        raw: row,
+        timestamp: Number(row.now),
+        to: address,
+      };
+    }));
+  }
+
+  const token = tonAssets[asset];
+  if (!token) return [];
+  const payload = await json<{ jetton_transfers?: unknown[] }>(`https://toncenter.com/api/v3/jetton/transfers?owner_address=${encodeURIComponent(address)}&direction=in&limit=50&start_utime=${start}&end_utime=${end}`);
+  return valid((payload.jetton_transfers ?? []).flatMap((item) => {
+    const row = item as Record<string, unknown>;
+    if (String(row.jetton_master ?? "") !== token.contract) return [];
+    return [{
+      amount: unitAmount(row.amount, token.decimals),
+      currency: asset,
+      hash: String(row.transaction_hash ?? ""),
+      raw: row,
+      timestamp: Number(row.transaction_now),
+      to: address,
+    }];
+  }));
+}
+
+async function aptos(payment: ProbePayment, order: ProbeOrder) {
+  const address = String(payment.address || "");
+  const asset = key(payment.currency);
+  const token = aptosAssets[asset];
+  if (!address || !token) return [];
+  const payload = await json<{ data?: { fungible_asset_activities?: unknown[] } }>("https://api.mainnet.aptoslabs.com/v1/graphql", {
+    body: JSON.stringify({
+      query: `
+        query($owner: String!, $assets: [String!], $start: timestamp!, $end: timestamp!) {
+          fungible_asset_activities(
+            where: {
+              owner_address: { _eq: $owner }
+              asset_type: { _in: $assets }
+              transaction_timestamp: { _gte: $start, _lte: $end }
+              type: { _eq: "deposit" }
+              is_transaction_success: { _eq: true }
+            }
+            order_by: { transaction_timestamp: desc }
+            limit: 50
+          ) {
+            amount
+            asset_type
+            transaction_timestamp
+            transaction_version
+            owner_address
+          }
+        }
+      `,
+      variables: {
+        assets: [token.contract],
+        end: new Date(Math.max(0, Number(order.expireAt ?? 0)) * 1000).toISOString(),
+        owner: address,
+        start: new Date(Math.max(0, Number(order.createdAt ?? 0)) * 1000).toISOString(),
+      },
+    }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  return valid((payload.data?.fungible_asset_activities ?? []).map((item) => {
+    const row = item as Record<string, unknown>;
+    return {
+      amount: unitAmount(row.amount, token.decimals),
+      currency: asset,
+      hash: String(row.transaction_version ?? ""),
+      raw: row,
+      timestamp: time(row.transaction_timestamp),
+      to: String(row.owner_address ?? ""),
+    };
+  }));
+}
+
+async function tronGrid<T>(address: string, path: string, params: URLSearchParams) {
+  const payload = await json<{ data?: T[] }>(`https://api.trongrid.io/v1/accounts/${encodeURIComponent(address)}/${path}?${params}`);
+  return Array.isArray(payload.data) ? payload.data : [];
+}
+
+async function rpc<T>(endpoint: string, method: string, params: unknown[]) {
+  const payload = await json<{ result?: T }>(endpoint, {
+    body: JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  });
+  return payload.result as T;
+}
+
+async function json<T>(url: string, init: RequestInit = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    if (!res.ok) return {} as T;
+    return res.json() as Promise<T>;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function matches(payment: ProbePayment, order: ProbeOrder, tx: TxCandidate) {
+  const createdAt = Number(order.createdAt ?? 0);
+  const expireAt = Number(order.expireAt ?? 0);
+  const targetAmount = Number(payment.amount);
+  return Boolean(tx.hash)
+    && tx.timestamp >= createdAt
+    && tx.timestamp <= expireAt
+    && key(tx.currency) === key(payment.currency)
+    && sameAmount(tx.amount, targetAmount)
+    && sameAddress(tx.to, payment.address);
+}
+
+function valid(candidates: Array<TxCandidate | null>) {
+  return candidates.filter((item): item is TxCandidate => Boolean(item?.hash && Number.isFinite(item.amount) && Number.isFinite(item.timestamp)));
+}
+
+function sameAddress(a: unknown, b: unknown) {
+  return String(a ?? "").toLowerCase() === String(b ?? "").toLowerCase();
+}
+
+function addressOf(value: unknown) {
+  return typeof value === "string" ? value : String((value as { hash?: unknown } | null)?.hash ?? "");
+}
+
+function time(value: unknown) {
+  return Math.floor(Date.parse(String(value)) / 1000);
+}
+
+function hex(value: number) {
+  return `0x${value.toString(16)}`;
+}
+
+function topicAddress(address: string) {
+  return `0x${address.slice(2).toLowerCase().padStart(64, "0")}`;
+}

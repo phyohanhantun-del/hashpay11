@@ -1,0 +1,166 @@
+import { createHmac, randomBytes } from "node:crypto";
+import { AppError } from "@/server/http/api";
+import type { PaymentChannel } from "@/server/payments/channels";
+import type { PaymentCheckInput } from "@/server/payments/driver";
+import type { Order } from "@/server/services/orders/repository";
+import { paymentMatches } from "@/server/payments/match";
+import { fetchText, reason, responseReason } from "@/server/utils/http";
+import { key } from "@/shared/payments";
+import type { PaymentSnapshot } from "@/shared/types/domain";
+
+export const binance = { check, create, scan, validate: check };
+
+const api = "https://api-gcp.binance.com/sapi/v1/pay/transactions";
+const accountApi = "https://api-gcp.binance.com/api/v3/account";
+const receiveApi = "https://bpay.binanceapi.com/binancepay/openapi/user/c2c/createReceive";
+const historyPageSize = 100;
+const maxHistoryCalls = 7;
+
+interface BinancePayRow {
+  amount?: string | number;
+  currency?: string;
+  fundsDetail?: Array<{ amount?: string | number; currency?: string }>;
+  receiverInfo?: { binanceId?: unknown };
+  transactionId?: string;
+  transactionTime?: string | number;
+}
+
+async function create(channel: PaymentChannel, order: Order, snapshot: PaymentSnapshot) {
+  const apiKey = channel.data.aiApiKey?.trim();
+  const secretKey = channel.data.aiSecretKey?.trim();
+  if (!apiKey || !secretKey) return snapshot;
+  try {
+    const url = await receiveLink(apiKey, secretKey, JSON.stringify({
+      amount: String(snapshot.amount),
+      currency: snapshot.currency.toUpperCase(),
+      description: order.id,
+    }));
+    return { ...snapshot, url };
+  } catch (error) {
+    console.error(`binance receive link ${error instanceof Error ? error.message : error}`);
+    return snapshot;
+  }
+}
+
+async function check(input: Pick<PaymentChannel, "address" | "data">) {
+  const payload = await signedGet<{ uid?: unknown }>(accountApi, input.data.apiKey, input.data.secretKey);
+  const uid = String(payload.uid ?? "").trim();
+  if (!uid) throw new AppError(400, "errors.payment_account_id_invalid", { detail: "Binance API 返回中没有账户ID" });
+  if (uid !== input.address) {
+    throw new AppError(400, "errors.payment_account_id_invalid", { detail: `API 返回账户ID ${uid}，与填写的 ${input.address} 不一致` });
+  }
+}
+
+async function scan(input: PaymentCheckInput) {
+  const rows = await history(input);
+  return paymentMatches(input.orders, rows, match, (tx) => ({
+    time: timestamp(tx),
+    txid: String(tx.transactionId),
+  }), input.tolerance);
+}
+
+async function history(input: PaymentCheckInput) {
+  const channel = input.channel;
+  if (!channel) return [];
+  const apiKey = String(channel.data.apiKey ?? "").trim();
+  const secretKey = String(channel.data.secretKey ?? "").trim();
+  if (!apiKey || !secretKey) throw new AppError(400, "errors.payment_credential_missing");
+
+  const start = Math.min(...input.orders.map((order) => order.createdAt)) * 1000;
+  const end = Math.max(...input.orders.map((order) => order.expireAt)) * 1000;
+  return historyWindow(apiKey, secretKey, start, end, { calls: 0 });
+}
+
+// The endpoint returns at most 100 rows per window and its sort order is undocumented, so a
+// full page is split into two disjoint halves until each fits. Each call costs 3000 UID weight,
+// so the split is bounded; a truncated scan still only matches rows Binance actually returned.
+async function historyWindow(apiKey: string, secretKey: string, start: number, end: number, budget: { calls: number }): Promise<BinancePayRow[]> {
+  budget.calls += 1;
+  const payload = await signedGet<{ code?: string; data?: unknown; success?: boolean }>(api, apiKey, secretKey, {
+    endTime: String(end),
+    limit: String(historyPageSize),
+    recvWindow: "5000",
+    startTime: String(start),
+  });
+  if (payload.success === false || (payload.code && payload.code !== "000000")) {
+    throw new Error(`Binance response failed: ${payload.code ?? "unknown"}`);
+  }
+  const rows = Array.isArray(payload.data) ? payload.data as BinancePayRow[] : [];
+  if (rows.length < historyPageSize || end <= start) return rows;
+  if (budget.calls + 2 > maxHistoryCalls) {
+    console.warn(`binance pay history truncated: more than ${historyPageSize} rows in ${start}-${end}`);
+    return rows;
+  }
+  const mid = Math.floor((start + end) / 2);
+  const older = await historyWindow(apiKey, secretKey, start, mid, budget);
+  const newer = await historyWindow(apiKey, secretKey, mid + 1, end, budget);
+  return [...older, ...newer];
+}
+
+async function receiveLink(apiKey: string, secretKey: string, body: string) {
+  const timestamp = Date.now();
+  const nonce = randomBytes(16).toString("hex");
+  const signature = createHmac("sha512", secretKey).update(`${timestamp}\n${nonce}\n${body}\n`).digest("hex").toUpperCase();
+  const { res, text } = await fetchText(receiveApi, {
+    body,
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "BinancePay-Certificate-SN": apiKey,
+      "BinancePay-Nonce": nonce,
+      "BinancePay-Signature": signature,
+      "BinancePay-Timestamp": String(timestamp),
+      // Required: Binance Pay rejects these requests from Workers egress without them (c60d78a).
+      "CF-Connecting-IP": "1.1.1.1",
+      "True-Client-IP": "1.1.1.1",
+      "X-Forwarded-For": "1.1.1.1",
+      "X-Real-IP": "1.1.1.1",
+    },
+    method: "POST",
+  });
+  let shareLink = "";
+  try {
+    shareLink = String((JSON.parse(text || "{}") as { data?: { shareLink?: unknown } }).data?.shareLink ?? "").trim();
+  } catch {
+    shareLink = "";
+  }
+  if (res.ok && shareLink) return shareLink;
+  throw new Error(`HTTP ${res.status} ${reason(text)}`.slice(0, 500));
+}
+
+async function signedGet<T>(url: string, apiKey: string, secretKey: string, data: Record<string, string> = {}) {
+  if (!apiKey || !secretKey) throw new AppError(400, "errors.payment_credential_missing");
+  const query = new URLSearchParams({ ...data, timestamp: String(Date.now()) }).toString();
+  const signature = createHmac("sha256", secretKey).update(query).digest("hex");
+  const { res, text } = await fetchText(`${url}?${query}&signature=${signature}`, {
+    headers: { accept: "application/json", "X-MBX-APIKEY": apiKey },
+  });
+  if (!res.ok) {
+    throw new AppError(400, "errors.payment_api_credential_invalid", { detail: responseReason(res, text) });
+  }
+  return JSON.parse(text || "{}") as T;
+}
+
+function match(snapshot: PaymentSnapshot, row: BinancePayRow, created: number, expire: number) {
+  const time = timestamp(row);
+  if (!row.transactionId || time < created || time > expire) return null;
+  if (String(row.receiverInfo?.binanceId ?? "").trim() !== String(snapshot.address).trim()) return null;
+  const amounts = funds(row)
+    .filter((fund) => key(fund.currency) === key(snapshot.currency))
+    .map((fund) => Number(fund.amount))
+    .filter((amount) => Number.isFinite(amount) && amount > 0);
+  return amounts.reduce<number | null>((closest, amount) => {
+    if (closest == null) return amount;
+    return Math.abs(amount - snapshot.amount) < Math.abs(closest - snapshot.amount) ? amount : closest;
+  }, null);
+}
+
+function funds(row: BinancePayRow) {
+  if (Array.isArray(row.fundsDetail) && row.fundsDetail.length) return row.fundsDetail;
+  return [{ amount: row.amount, currency: row.currency }];
+}
+
+function timestamp(row: BinancePayRow) {
+  const value = Number(row.transactionTime);
+  return Math.floor(value > 10_000_000_000 ? value / 1000 : value);
+}
